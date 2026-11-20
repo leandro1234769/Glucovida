@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glucovida-backend"
+version = "0.1.0"
+dependencies = [
+    "alembic>=1.13,<2",
+    "bcrypt>=4.2,<6",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic[email]>=2,<3",
+    "sqlalchemy>=2.0,<2.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+include = ["app", "app.*"]
