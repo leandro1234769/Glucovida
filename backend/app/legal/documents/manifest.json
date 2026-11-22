@@ -1,0 +1,38 @@
+[
+  {
+    "kind": "terms",
+    "version": "terms-v1.0.0",
+    "status": "draft",
+    "sha256": "7c0bf7498b95da6058fde6bc5b13e25ed30b049f65b48d744fdaf9307e9df32e"
+  },
+  {
+    "kind": "privacy",
+    "version": "privacy-v1.0.0",
+    "status": "draft",
+    "sha256": "376857b9d8b8a50a75e43dc8721aef34100bc6975719303ed921a54c43133383"
+  },
+  {
+    "kind": "health_data",
+    "version": "health-data-v1.0.0",
+    "status": "draft",
+    "sha256": "0db148acc70c3df1ca4a147b4a79befbbc1cfae9f2b8169b33ea60b0905b7542"
+  },
+  {
+    "kind": "terms",
+    "version": "terms-test-v1",
+    "status": "test",
+    "sha256": "201249a91772bdd04d079b5882e81a5db6f980b1f0aa509d529aea6ed914dd20"
+  },
+  {
+    "kind": "privacy",
+    "version": "privacy-test-v1",
+    "status": "test",
+    "sha256": "17451cb3a43d3757b4ac4705599c5e082bdb80f7f0c04bcd3276d802e81dd31b"
+  },
+  {
+    "kind": "health_data",
+    "version": "health-data-test-v1",
+    "status": "test",
+    "sha256": "b6600699f370ff9e57031bdfe6386e650be721c9a178ef49cfeb5529055fc5eb"
+  }
+]

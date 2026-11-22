@@ -1,37 +1,16 @@
-import os
-
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from fastapi import Request
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from collections.abc import AsyncIterator
 
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+def create_database_engine(database_url: str) -> AsyncEngine:
+    return create_async_engine(
+        database_url, pool_pre_ping=True, pool_size=10, max_overflow=20,
+        hide_parameters=True,
+    )
 
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=10,
-)
-
-
-AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
-
-
-async def get_db():
-    """
-    Dependencia de FastAPI.
-
-    Proporciona una sesión independiente por solicitud.
-    """
-
-    async with AsyncSessionLocal() as session:
+async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+    """Provide an independent database session for the HTTP request."""
+    async with request.app.state.database_sessions() as session:
         yield session

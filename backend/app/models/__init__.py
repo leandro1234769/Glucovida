@@ -7,7 +7,13 @@ from app.models.auth import (
     User,
 )
 
+from app.models.consent import RegistrationConsent
+
+from app.models.consent_evidence import ConsentEvidence
+
 __all__ = [
+    "ConsentEvidence",
+    "RegistrationConsent",
     "User",
     "AuthSession",
     "AuthRefreshToken",
