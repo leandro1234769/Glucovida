@@ -6,6 +6,7 @@ from email import policy
 from email.parser import BytesParser
 from hashlib import sha256
 from http.cookies import SimpleCookie
+from ipaddress import ip_address
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -68,7 +69,7 @@ def test_registration_with_real_redis_and_smtp(tmp_path, monkeypatch):
     ca.issue_cert("127.0.0.1").configure_cert(server_tls)
 
     mailbox = TestMailbox()
-    client_ip = f"2001:db8::{uuid4().hex[:4]}:{uuid4().hex[:4]}"
+    client_ip = str(ip_address(f"2001:db8::{uuid4().hex[:4]}:{uuid4().hex[:4]}"))
     email = f"{uuid4()}@example.com"
     limit_secret = ("test-rate-" + uuid4().hex)
     engine = create_engine(database_url)

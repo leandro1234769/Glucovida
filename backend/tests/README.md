@@ -87,3 +87,18 @@ El registro y el reenvio emiten la misma respuesta generica. El correo se
 envia despues de confirmar la transaccion, como tarea local de la respuesta.
 Si el envio falla o el proceso se interrumpe, la persona puede solicitar
 otro enlace.
+
+
+## Inicio de sesion en desarrollo y pruebas
+
+Configura `GLUCOVIDA_JWT_PRIVATE_KEY_FILE` con la ruta a una clave privada RSA
+PEM de al menos 2048 bits almacenada fuera de Git, y define
+`GLUCOVIDA_JWT_ISSUER` y `GLUCOVIDA_JWT_AUDIENCE` para tu API.
+`POST /api/v1/auth/login` devuelve un JWT Bearer de 15 minutos y coloca
+el token de renovacion en la cookie segura `__Host-gv_refresh`.
+Guarda el nuevo encabezado `X-CSRF-Token` para solicitudes posteriores.
+
+Las rutas protegidas pueden usar `Depends(require_access_session)`. Esa
+dependencia valida el JWT y aplica tanto las 24 horas de vigencia absoluta
+como los 30 minutos de inactividad contra la sesion persistida. La ruta de
+login se habilita solo en development y test con clave configurada.

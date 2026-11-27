@@ -17,6 +17,9 @@ from app.schemas.auth import ConsentVersions, DocumentVersion
 class RegistrationSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GLUCOVIDA_", env_file=".env", extra="ignore", env_ignore_empty=True)
 
+    jwt_private_key_file: Path | None = None
+    jwt_issuer: str = "https://api.glucovida.local"
+    jwt_audience: str = "glucovida-api"
     environment: Environment = "production"
     public_registration_enabled: bool | None = None
     production_release_approved: bool = False

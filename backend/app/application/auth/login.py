@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
 from uuid import UUID
@@ -30,6 +30,8 @@ class LoginSession:
     user_id: UUID
     session_id: UUID
     auth_version: int
+    created_at: datetime
+    expires_at: datetime
     refresh_token: SecretStr = field(repr=False)
 
 
@@ -72,7 +74,7 @@ async def login_user(session: AsyncSession, credentials: LoginInput) -> LoginSes
                         expires_at=expires_at,
                     ))
                     result = LoginSession(
-                        user.id, auth_session.id, user.auth_version, SecretStr(raw_token)
+                        user.id, auth_session.id, user.auth_version, now, expires_at, SecretStr(raw_token)
                     )
                 else:
                     user.failed_login_attempts = min(user.failed_login_attempts + 1, _MAX_FAILED_ATTEMPTS)

@@ -26,10 +26,11 @@ class RegistrationRateLimited(Exception):
 
 class RegistrationRateLimiter:
     def __init__(
-        self, redis: Redis, *, key_secret: bytes, per_ip: RateLimit, per_email: RateLimit,
+        self, redis: Redis, *, key_secret: bytes, per_ip: RateLimit, per_email: RateLimit, scope: str = "register",
     ):
         if len(key_secret) < 32:
             raise ValueError("Rate-limit key secret must contain at least 32 bytes")
+        self._scope = scope
         self._redis = redis
         self._key_secret = key_secret
         self._per_ip = per_ip
@@ -52,8 +53,8 @@ class RegistrationRateLimiter:
             self._key_secret, normalized_email.encode("utf-8"), "sha256"
         ).hex()
         await self._require_limits({
-            f"rl:{{register}}:ip:{address}": self._per_ip,
-            f"rl:{{register}}:email:{email_key}": self._per_email,
+            f"rl:{{{self._scope}}}:ip:{address}": self._per_ip,
+            f"rl:{{{self._scope}}}:email:{email_key}": self._per_email,
         })
 
     async def _require_limits(self, limits: dict[str, RateLimit]) -> None:

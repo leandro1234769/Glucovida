@@ -376,3 +376,137 @@ def test_login_creates_session_and_refresh_only_after_valid_credentials(database
     assert refresh.expires_at == session.absolute_expires_at
     assert refresh.issued_at == session.created_at
     assert state.failed_login_attempts == 0 and state.login_locked_until is None
+
+def test_http_login_and_inactivity(database, emails, tmp_path):
+    import hmac
+    import os
+    from datetime import timezone
+    from http.cookies import SimpleCookie
+    from ipaddress import ip_address
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from fastapi import Depends
+    from httpx import ASGITransport, AsyncClient
+    from pydantic import SecretStr
+    from redis.asyncio import Redis
+
+    from app.api.login import require_access_session
+    from app.main import create_app
+    from app.registration_settings import RegistrationSettings
+
+    redis_url = os.environ.get("TEST_REDIS_URL")
+    if not redis_url:
+        pytest.skip("Set TEST_REDIS_URL to exercise login over real Redis")
+
+    engine, register, runner, _, _ = database
+    email = emails[0]
+    user = register(registration_input(email))
+    with engine.begin() as connection:
+        connection.execute(update(User).where(User.id == user.user_id).values(
+            account_status="active", email_verified_at=text("now()")
+        ))
+
+    key_path = tmp_path / "test-jwt.pem"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path.write_bytes(private_key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ))
+    origin = "https://app.example.com"
+    rate_key = uuid4().hex
+    ip = str(ip_address(f"2001:db8::{uuid4().hex[:4]}:{uuid4().hex[:4]}"))
+    account_key = hmac.digest(rate_key.encode(), email.encode(), "sha256").hex()
+    keys = (f"rl:{{login}}:ip:{ip}", f"rl:{{login}}:email:{account_key}")
+    settings = RegistrationSettings(
+        _env_file=None, environment="test", public_registration_enabled=False,
+        DATABASE_URL=engine.url.render_as_string(hide_password=False),
+        allowed_origins={origin}, csrf_key="c" * 32, rate_limit_key=rate_key,
+        redis_url=redis_url, jwt_private_key_file=key_path,
+        smtp_host="localhost", smtp_sender="no-reply@example.com",
+        verification_page="https://app.example.com/verify",
+        **VERSIONS.model_dump(), verification_ttl_minutes=30,
+        registration_ip_requests=5, registration_ip_window_seconds=60,
+        registration_email_requests=2, registration_email_window_seconds=900,
+    )
+    app = create_app(settings)
+
+    @app.get("/protected")
+    async def protected(claims=Depends(require_access_session)):
+        return {"user_id": claims.user_id}
+
+    async def run():
+        async with (
+            app.router.lifespan_context(app),
+            Redis.from_url(redis_url) as redis,
+            AsyncClient(
+                transport=ASGITransport(app=app, client=(ip, 3000)),
+                base_url="https://api.example.com",
+            ) as http,
+        ):
+            try:
+                csrf = await http.get("/api/v1/auth/csrf", headers={"Origin": origin})
+                headers = {"Origin": origin, "X-CSRF-Token": csrf.json()["csrf_token"]}
+                url = "/api/v1/auth/login"
+                body = {"email": email.upper(), "password": PASSWORD}
+                assert (await http.post(url, json=body)).status_code == 403
+                wrong = await http.post(url, json={**body, "password": "wrong"}, headers=headers)
+                assert wrong.status_code == 401
+                for key in keys:
+                    seconds, microseconds = await redis.time()
+                    now_ms = seconds * 1000 + microseconds // 1000
+                    await redis.zadd(key, {str(n): now_ms for n in range(30)})
+                    limited = await http.post(url, json=body, headers=headers)
+                    assert limited.status_code == 429 and int(limited.headers["Retry-After"]) > 0
+                    await redis.delete(key)
+
+                response = await http.post(url, json=body, headers=headers)
+                assert response.status_code == 200
+                assert response.headers["cache-control"] == "no-store"
+                payload = response.json()
+                assert set(payload) == {"access_token", "token_type", "expires_in"}
+                assert payload["token_type"] == "Bearer" and payload["expires_in"] == 900
+                assert response.headers["X-CSRF-Token"] != headers["X-CSRF-Token"]
+                cookies = SimpleCookie()
+                for value in response.headers.get_list("set-cookie"):
+                    cookies.load(value)
+                refresh = cookies["__Host-gv_refresh"]
+                assert refresh["httponly"] and refresh["secure"] and refresh["samesite"] == "strict"
+                assert refresh["path"] == "/" and not refresh["domain"]
+                assert 86395 <= int(refresh["max-age"]) <= 86400
+
+                signer = app.state.access_token_signer
+                claims = signer.decode(payload["access_token"])
+                assert claims.user_id == user.user_id
+                access = {"Authorization": f"Bearer {payload['access_token']}"}
+                assert (await http.get("/protected", headers=access)).status_code == 200
+                with engine.begin() as connection:
+                    stored_hash = connection.scalar(select(AuthRefreshToken.token_hash).where(
+                        AuthRefreshToken.session_id == claims.session_id
+                    ))
+                    assert stored_hash == sha256(refresh.value.encode("ascii")).digest()
+                    now = connection.scalar(text("SELECT clock_timestamp()"))
+                    session_id = uuid4()
+                    connection.execute(AuthSession.__table__.insert().values(
+                        id=session_id, user_id=user.user_id, auth_version_at_creation=claims.auth_version,
+                        created_at=now - timedelta(hours=1),
+                        last_activity_at=now - timedelta(minutes=30),
+                        absolute_expires_at=now + timedelta(hours=23),
+                    ))
+
+                fresh_jwt = signer.issue(login.LoginSession(
+                    user.user_id, session_id, claims.auth_version,
+                    now.astimezone(timezone.utc), now + timedelta(hours=23), SecretStr("unused"),
+                ))
+                assert signer.decode(fresh_jwt).session_id == session_id
+                denied = await http.get("/protected", headers={"Authorization": f"Bearer {fresh_jwt}"})
+                assert denied.status_code == 401
+                with engine.connect() as connection:
+                    last_activity = connection.scalar(select(AuthSession.last_activity_at).where(
+                        AuthSession.id == session_id
+                    ))
+                assert last_activity == now - timedelta(minutes=30)
+            finally:
+                await redis.delete(*keys)
+
+    runner.run(run())

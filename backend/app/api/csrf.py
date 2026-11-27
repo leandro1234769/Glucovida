@@ -15,10 +15,14 @@ def create_csrf_router(protection: CsrfProtection) -> APIRouter:
     def issue_csrf(response: Response) -> CsrfResponse:
         token = protection.issue()
         response.headers["Cache-Control"] = "no-store"
-        response.set_cookie(
-            CSRF_COOKIE, token, max_age=CSRF_MAX_AGE, path="/",
-            secure=True, httponly=False, samesite="strict",
-        )
+        set_csrf_cookie(response, token)
         return CsrfResponse(csrf_token=token)
 
     return router
+
+
+def set_csrf_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        CSRF_COOKIE, token, max_age=CSRF_MAX_AGE, path="/",
+        secure=True, httponly=False, samesite="strict",
+    )
