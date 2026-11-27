@@ -1,10 +1,10 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.security.access_tokens import AccessClaims
-from app.models import AuthSession, User
+from app.models import AuthRefreshToken, AuthSession, User
 
 
 SESSION_IDLE_TIMEOUT = timedelta(minutes=30)
@@ -35,3 +35,23 @@ async def touch_session(session: AsyncSession, claims: AccessClaims) -> None:
         )
         if touched is None:
             raise SessionExpired
+
+
+async def revoke_session(
+    session: AsyncSession, target: AuthSession, revoked_at: datetime, *, reason: str,
+) -> None:
+    """Revoke a locked session and all of its unconsumed refresh tokens."""
+    target.revoked_at = revoked_at
+    target.revoke_reason = reason
+    await session.execute(
+        update(AuthRefreshToken)
+        .where(
+            AuthRefreshToken.session_id == target.id,
+            AuthRefreshToken.consumed_at.is_(None),
+            AuthRefreshToken.revoked_at.is_(None),
+        )
+        .values(
+            revoked_at=func.greatest(AuthRefreshToken.issued_at, revoked_at),
+            revoke_reason=reason,
+        )
+    )

@@ -2,7 +2,7 @@ import hmac
 from math import ceil
 from dataclasses import dataclass
 from ipaddress import ip_address
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
@@ -46,6 +46,13 @@ class RegistrationRateLimiter:
     async def require_confirmation(self, client_ip: str) -> None:
         address = self._normalize_address(client_ip)
         await self._require_limits({f"rl:{{confirm}}:ip:{address}": self._per_ip})
+
+    async def require_refresh_ip(self, client_ip: str) -> None:
+        address = self._normalize_address(client_ip)
+        await self._require_limits({f"rl:{{refresh}}:ip:{address}": self._per_ip})
+
+    async def require_refresh_session(self, session_id: UUID) -> None:
+        await self._require_limits({f"rl:{{refresh}}:session:{session_id}": RateLimit(5, 60)})
 
     async def require(self, client_ip: str, normalized_email: str) -> None:
         address = self._normalize_address(client_ip)

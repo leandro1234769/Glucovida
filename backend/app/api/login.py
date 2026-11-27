@@ -3,6 +3,7 @@ from typing import Annotated, Literal
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from redis.exceptions import RedisError
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth_requests import read_payload, request_context
 from app.api.csrf import set_csrf_cookie
 from app.application.auth.login import InvalidCredentials, LoginSession, login_user
+from app.application.auth.refresh import InvalidRefreshToken, rotate_refresh_token
 from app.application.auth.session_activity import SessionExpired, touch_session
 from app.database.session import get_db
 from app.infrastructure.redis.registration_limits import RegistrationRateLimited
@@ -56,6 +58,39 @@ def create_login_router() -> APIRouter:
 
         return _issue_credentials(request, response, credentials)
 
+    @router.post("/refresh", response_model=LoginResponse)
+    async def refresh(
+        request: Request, response: Response, session: Annotated[AsyncSession, Depends(get_db)],
+    ) -> LoginResponse | Response:
+        async for chunk in request.stream():
+            if chunk:
+                raise HTTPException(400, "Expected an empty request body")
+        context = request_context(request)
+        limits = request.app.state.login_limits
+        try:
+            request.app.state.csrf.require(context.origin, context.csrf_cookie, context.csrf_header)
+            await limits.require_refresh_ip(context.client_ip)
+            credentials = await rotate_refresh_token(
+                session, request.cookies.get(REFRESH_COOKIE, ""),
+                check_session_limit=limits.require_refresh_session,
+            )
+        except CsrfRejected:
+            raise HTTPException(403, "Invalid request origin or CSRF token") from None
+        except RegistrationRateLimited as error:
+            raise HTTPException(
+                429, "Too many requests", headers={"Retry-After": str(error.retry_after)}
+            ) from None
+        except RedisError:
+            raise HTTPException(503, "Authentication temporarily unavailable") from None
+        except InvalidRefreshToken:
+            invalid = JSONResponse(
+                {"detail": "Invalid or expired session"}, status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+            invalid.delete_cookie(REFRESH_COOKIE, path="/", httponly=True, secure=True, samesite="strict")
+            return invalid
+        return _issue_credentials(request, response, credentials)
+
     return router
 
 
@@ -72,7 +107,8 @@ def _issue_credentials(
     csrf_token = request.app.state.csrf.issue()
     set_csrf_cookie(response, csrf_token)
     response.headers["X-CSRF-Token"] = csrf_token
-    return LoginResponse(access_token=access_token)
+    remaining = int(credentials.expires_at.timestamp()) - int(credentials.created_at.timestamp())
+    return LoginResponse(access_token=access_token, expires_in=min(ACCESS_TOKEN_SECONDS, remaining))
 
 
 async def require_access_session(

@@ -19,7 +19,7 @@ from app.application.auth import consent, login, registration
 from app.application.auth.registration_workflow import RegistrationContext, RegistrationWorkflow
 from app.infrastructure.redis.registration_limits import RateLimit, RegistrationRateLimiter
 from app.infrastructure.security.csrf import CsrfProtection, CsrfRejected
-from app.models import AuthRefreshToken, AuthSession, ConsentEvidence, EmailVerificationToken, User
+from app.models import AuditEvent, AuthRefreshToken, AuthSession, ConsentEvidence, EmailVerificationToken, User
 from app.schemas.auth import ConsentVersions, LoginInput, RegistrationInput
 
 
@@ -77,6 +77,9 @@ def emails(database):
         yield addresses
     finally:
         with engine.begin() as connection:
+            connection.execute(delete(AuditEvent).where(
+                AuditEvent.user_id.in_(select(User.id).where(User.email.in_(addresses)))
+            ))
             user_ids = connection.scalars(
                 delete(User).where(User.email.in_(addresses)).returning(User.id)
             ).all()
@@ -377,12 +380,13 @@ def test_login_creates_session_and_refresh_only_after_valid_credentials(database
     assert refresh.issued_at == session.created_at
     assert state.failed_login_attempts == 0 and state.login_locked_until is None
 
-def test_http_login_and_inactivity(database, emails, tmp_path):
+def test_http_login_refresh_reuse_and_inactivity(database, emails, tmp_path):
     import hmac
     import os
     from datetime import timezone
     from http.cookies import SimpleCookie
     from ipaddress import ip_address
+    from secrets import token_urlsafe
 
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -418,6 +422,7 @@ def test_http_login_and_inactivity(database, emails, tmp_path):
     ip = str(ip_address(f"2001:db8::{uuid4().hex[:4]}:{uuid4().hex[:4]}"))
     account_key = hmac.digest(rate_key.encode(), email.encode(), "sha256").hex()
     keys = (f"rl:{{login}}:ip:{ip}", f"rl:{{login}}:email:{account_key}")
+    refresh_keys = [f"rl:{{refresh}}:ip:{ip}"]
     settings = RegistrationSettings(
         _env_file=None, environment="test", public_registration_enabled=False,
         DATABASE_URL=engine.url.render_as_string(hide_password=False),
@@ -506,7 +511,98 @@ def test_http_login_and_inactivity(database, emails, tmp_path):
                         AuthSession.id == session_id
                     ))
                 assert last_activity == now - timedelta(minutes=30)
+                idle_raw = token_urlsafe(32)
+                with engine.begin() as connection:
+                    connection.execute(AuthRefreshToken.__table__.insert().values(
+                        session_id=session_id, token_hash=sha256(idle_raw.encode()).digest(),
+                        issued_at=now - timedelta(hours=1), expires_at=now + timedelta(hours=23),
+                    ))
+                    initial_session = connection.execute(select(AuthSession.__table__).where(
+                        AuthSession.id == claims.session_id
+                    )).one()
+
+                refresh_url = "/api/v1/auth/refresh"
+                csrf_value = response.headers["X-CSRF-Token"]
+                refresh_keys.extend([
+                    f"rl:{{refresh}}:session:{session_id}",
+                    f"rl:{{refresh}}:session:{claims.session_id}",
+                ])
+
+                def refresh_headers(raw_token, csrf_token):
+                    return {
+                        "Origin": origin, "X-CSRF-Token": csrf_token,
+                        "Cookie": f"__Host-gv_refresh={raw_token}; __Host-gv_csrf={csrf_token}",
+                    }
+
+                assert (await http.post(refresh_url)).status_code == 403
+                idle = await http.post(refresh_url, headers=refresh_headers(idle_raw, csrf_value))
+                assert idle.status_code == 401 and "Max-Age=0" in idle.headers["set-cookie"]
+
+                rotating = await http.post(refresh_url, headers=refresh_headers(refresh.value, csrf_value))
+                assert rotating.status_code == 200
+                assert rotating.json()["access_token"] != payload["access_token"]
+                assert signer.decode(rotating.json()["access_token"]).session_id == claims.session_id
+                new_csrf = rotating.headers["X-CSRF-Token"]
+                assert new_csrf != csrf_value
+                next_cookie = SimpleCookie()
+                next_cookie.load(rotating.headers.get_list("set-cookie")[0])
+                successor = next_cookie["__Host-gv_refresh"].value
+                assert successor != refresh.value
+
+                with engine.connect() as connection:
+                    tokens = connection.execute(select(AuthRefreshToken.__table__).where(
+                        AuthRefreshToken.session_id == claims.session_id
+                    ).order_by(AuthRefreshToken.issued_at)).all()
+                    current_session = connection.execute(select(AuthSession.__table__).where(
+                        AuthSession.id == claims.session_id
+                    )).one()
+                assert len(tokens) == 2
+                assert tokens[0].consumed_at is not None and tokens[0].replaced_by_token_id == tokens[1].id
+                assert tokens[1].token_hash == sha256(successor.encode()).digest()
+                assert tokens[1].expires_at == initial_session.absolute_expires_at
+                assert current_session.absolute_expires_at == initial_session.absolute_expires_at
+                assert current_session.last_activity_at >= initial_session.last_activity_at
+
+                reused = await http.post(refresh_url, headers=refresh_headers(refresh.value, new_csrf))
+                assert reused.status_code == 401
+                assert (await http.post(
+                    refresh_url, headers=refresh_headers(successor, new_csrf)
+                )).status_code == 401
+                assert (await http.get("/protected", headers=access)).status_code == 401
+                with engine.connect() as connection:
+                    assert connection.scalar(select(AuthSession.revoke_reason).where(
+                        AuthSession.id == claims.session_id
+                    )) == "refresh_reuse"
+                    assert connection.scalar(select(AuthRefreshToken.revoke_reason).where(
+                        AuthRefreshToken.id == tokens[1].id
+                    )) == "refresh_reuse"
+                    assert set(connection.scalars(select(AuditEvent.event_type).where(
+                        AuditEvent.session_id == claims.session_id
+                    ))) == {"refresh_rotated", "refresh_reuse_detected"}
+
+                fresh_csrf = await http.get("/api/v1/auth/csrf", headers={"Origin": origin})
+                signed_in = await http.post(url, json=body, headers={
+                    "Origin": origin, "X-CSRF-Token": fresh_csrf.json()["csrf_token"]
+                })
+                assert signed_in.status_code == 200
+                concurrent_session = signer.decode(signed_in.json()["access_token"]).session_id
+                refresh_keys.append(f"rl:{{refresh}}:session:{concurrent_session}")
+                new_cookies = SimpleCookie()
+                new_cookies.load(signed_in.headers.get_list("set-cookie")[0])
+                same_request = refresh_headers(
+                    new_cookies["__Host-gv_refresh"].value, signed_in.headers["X-CSRF-Token"]
+                )
+                attempts = await asyncio.gather(
+                    http.post(refresh_url, headers=same_request),
+                    http.post(refresh_url, headers=same_request),
+                )
+                assert sorted(result.status_code for result in attempts) == [200, 401]
+                with engine.connect() as connection:
+                    assert connection.scalar(select(AuthSession.revoke_reason).where(
+                        AuthSession.id == concurrent_session
+                    )) == "refresh_reuse"
+
             finally:
-                await redis.delete(*keys)
+                await redis.delete(*keys, *refresh_keys)
 
     runner.run(run())
