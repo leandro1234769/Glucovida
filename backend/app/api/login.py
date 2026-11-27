@@ -12,12 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth_requests import read_payload, request_context
 from app.api.csrf import set_csrf_cookie
 from app.application.auth.login import InvalidCredentials, LoginSession, login_user
+from app.application.auth.logout import logout_session
 from app.application.auth.refresh import InvalidRefreshToken, rotate_refresh_token
 from app.application.auth.session_activity import SessionExpired, touch_session
 from app.database.session import get_db
 from app.infrastructure.redis.registration_limits import RegistrationRateLimited
 from app.infrastructure.security.access_tokens import ACCESS_TOKEN_SECONDS, AccessClaims
-from app.infrastructure.security.csrf import CsrfRejected
+from app.infrastructure.security.csrf import CSRF_COOKIE, CsrfRejected
 from app.schemas.auth import LoginInput
 
 
@@ -90,6 +91,39 @@ def create_login_router() -> APIRouter:
             invalid.delete_cookie(REFRESH_COOKIE, path="/", httponly=True, secure=True, samesite="strict")
             return invalid
         return _issue_credentials(request, response, credentials)
+
+    @router.post("/logout", status_code=204, response_class=Response)
+    async def logout(
+        request: Request, session: Annotated[AsyncSession, Depends(get_db)],
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+    ) -> Response:
+        context = request_context(request)
+        raw_token = request.cookies.get(REFRESH_COOKIE)
+        csrf = request.app.state.csrf
+        try:
+            if (
+                raw_token is not None or context.csrf_cookie is not None
+                or request.headers.get("Authorization") is not None
+            ):
+                csrf.require(context.origin, context.csrf_cookie, context.csrf_header)
+            else:
+                # A retry after both cookies were deleted has no session to revoke.
+                csrf.require_origin(context.origin)
+        except CsrfRejected:
+            raise HTTPException(403, "Invalid request origin or CSRF token") from None
+
+        claims = None
+        if credentials is not None:
+            try:
+                claims = request.app.state.access_token_signer.decode(credentials.credentials)
+            except jwt.InvalidTokenError:
+                pass
+        await logout_session(session, claims, raw_token)
+
+        response = Response(status_code=204, headers={"Cache-Control": "no-store"})
+        response.delete_cookie(REFRESH_COOKIE, path="/", httponly=True, secure=True, samesite="strict")
+        response.delete_cookie(CSRF_COOKIE, path="/", secure=True, samesite="strict")
+        return response
 
     return router
 

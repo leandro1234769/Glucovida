@@ -26,8 +26,13 @@ class CsrfProtection:
         payload = f"{int(time())}.{token_urlsafe(32)}"
         return f"{payload}.{self._signature(payload)}"
 
+    def require_origin(self, origin: str | None) -> None:
+        if origin not in self._allowed_origins:
+            raise CsrfRejected("Invalid origin or CSRF token")
+
     def require(self, origin: str | None, cookie: str | None, header: str | None) -> None:
-        if origin not in self._allowed_origins or cookie is None or header is None:
+        self.require_origin(origin)
+        if cookie is None or header is None:
             raise CsrfRejected("Invalid origin or CSRF token")
         if (
             not _TOKEN_FORMAT.fullmatch(cookie)

@@ -602,6 +602,68 @@ def test_http_login_refresh_reuse_and_inactivity(database, emails, tmp_path):
                         AuthSession.id == concurrent_session
                     )) == "refresh_reuse"
 
+                async def start_device():
+                    token = await http.get("/api/v1/auth/csrf", headers={"Origin": origin})
+                    signed = await http.post(url, json=body, headers={
+                        "Origin": origin, "X-CSRF-Token": token.json()["csrf_token"],
+                    })
+                    assert signed.status_code == 200
+                    cookies = SimpleCookie()
+                    cookies.load(signed.headers.get_list("set-cookie")[0])
+                    jwt_token = signed.json()["access_token"]
+                    return (
+                        signer.decode(jwt_token).session_id,
+                        jwt_token,
+                        refresh_headers(
+                            cookies["__Host-gv_refresh"].value, signed.headers["X-CSRF-Token"]
+                        ),
+                    )
+
+                device, device_jwt, device_headers = await start_device()
+                other_device, other_jwt, other_headers = await start_device()
+                refresh_keys.append(f"rl:{{refresh}}:session:{device}")
+                logout_url = "/api/v1/auth/logout"
+                access_headers = {"Authorization": f"Bearer {device_jwt}"}
+                assert (await http.post(logout_url, headers={
+                    **device_headers, "X-CSRF-Token": "invalid",
+                })).status_code == 403
+                assert (await http.get("/protected", headers=access_headers)).status_code == 200
+
+                # The bearer identifies the target even if the browser supplies a different cookie.
+                closed = await http.post(logout_url, headers={**other_headers, **access_headers})
+                assert closed.status_code == 204 and not closed.content
+                deleted = SimpleCookie()
+                for value in closed.headers.get_list("set-cookie"):
+                    deleted.load(value)
+                assert set(deleted) == {"__Host-gv_refresh", "__Host-gv_csrf"}
+                for cookie in deleted.values():
+                    assert cookie["max-age"] == "0" and cookie["secure"] and cookie["path"] == "/"
+                assert deleted["__Host-gv_refresh"]["httponly"]
+
+                assert (await http.post(logout_url, headers={"Origin": origin})).status_code == 204
+                assert (await http.post(logout_url)).status_code == 403
+                assert (await http.get("/protected", headers=access_headers)).status_code == 401
+                assert (await http.post(refresh_url, headers=device_headers)).status_code == 401
+                assert (await http.get("/protected", headers={
+                    "Authorization": f"Bearer {other_jwt}",
+                })).status_code == 200
+
+                # An invalid or expired bearer falls back to the valid refresh cookie.
+                assert (await http.post(logout_url, headers={
+                    **other_headers, "Authorization": "Bearer invalid",
+                })).status_code == 204
+                with engine.connect() as connection:
+                    for target in (device, other_device):
+                        assert connection.scalar(select(AuthSession.revoke_reason).where(
+                            AuthSession.id == target
+                        )) == "logout"
+                        assert connection.scalar(select(AuthRefreshToken.revoke_reason).where(
+                            AuthRefreshToken.session_id == target
+                        )) == "logout"
+                        assert connection.scalars(select(AuditEvent.event_type).where(
+                            AuditEvent.session_id == target
+                        )).all() == ["logout"]
+
             finally:
                 await redis.delete(*keys, *refresh_keys)
 
